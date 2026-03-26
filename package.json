@@ -1,0 +1,46 @@
+{
+  "name": "pure-qqbot",
+  "version": "1.0.0",
+  "description": "Pure QQ Bot SDK - Independent from OpenClaw framework. Direct WebSocket connection to QQ Bot API.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "qq",
+    "bot",
+    "sdk",
+    "qqbot",
+    "websocket",
+    "message",
+    "chatbot"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-username/qqbot-sdk.git"
+  },
+  "bugs": {
+    "url": "https://github.com/your-username/qqbot-sdk/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/ws": "^8.5.0",
+    "typescript": "^5.9.3"
+  }
+}

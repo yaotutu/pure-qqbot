@@ -1,0 +1,12 @@
+# Example files
+dist/example.js
+dist/example.js.map
+dist/example.d.ts
+dist/example.d.ts.map
+
+# Source maps (optional, reduce package size)
+# *.map
+
+# Development
+*.test.js
+*.spec.js
