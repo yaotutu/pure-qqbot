@@ -4,7 +4,7 @@ Pure QQ Bot SDK - 纯净的 QQ Bot 开发包，从 `openclaw-qqbot` 提取核心
 
 ## 前置要求
 
-1. 在 [QQ 开放平台](https://open.qq.com/) 注册机器人应用
+1. 在 [QQ 开放平台](https://q.qq.com/qqbot/openclaw/login.html) 注册机器人应用
 2. 获取 `AppID` 和 `ClientSecret`
 
 ## 安装

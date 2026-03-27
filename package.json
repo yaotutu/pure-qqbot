@@ -5,9 +5,16 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsc",
@@ -23,15 +30,16 @@
     "message",
     "chatbot"
   ],
-  "author": "",
+  "author": "yaotutu",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/your-username/qqbot-sdk.git"
+    "url": "git+https://github.com/yaotutu/pure-qqbot.git"
   },
   "bugs": {
-    "url": "https://github.com/your-username/qqbot-sdk/issues"
+    "url": "https://github.com/yaotutu/pure-qqbot/issues"
   },
+  "homepage": "https://github.com/yaotutu/pure-qqbot#readme",
   "engines": {
     "node": ">=18.0.0"
   },
