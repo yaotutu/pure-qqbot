@@ -1,6 +1,6 @@
 {
   "name": "pure-qqbot",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Pure QQ Bot SDK - Independent from OpenClaw framework. Direct WebSocket connection to QQ Bot API.",
   "type": "module",
   "main": "dist/index.js",

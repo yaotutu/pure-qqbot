@@ -1,24 +1,67 @@
 /**
  * QQ Bot API 封装
- * 处理 Token 获取、消息发送、富媒体上传
+ * Token 管理、消息发送、富媒体上传、分块上传、流式消息、Inline Keyboard
  */
 
 import os from "node:os";
-import type { SendMessageResult, Logger, MediaFileType, UploadMediaResponse } from "./types.js";
+import type {
+  SendMessageResult,
+  SendMessageOptions,
+  Logger,
+  MediaFileType,
+  UploadMediaResponse,
+  UploadPrepareResponse,
+  UploadPart,
+  InlineKeyboard,
+  StreamMessageRequest,
+  TokenStatus,
+} from "./types.js";
+import { MSG_TYPE_TEXT, MSG_TYPE_MARKDOWN, MSG_TYPE_INLINE_KEYBOARD, MSG_TYPE_MEDIA, MSG_TYPE_INPUT_NOTIFY } from "./types.js";
 import { computeFileHash, getCachedFileInfo, setCachedFileInfo } from "./utils/upload-cache.js";
 import { sanitizeFileName, extractBase64FromDataUrl } from "./utils/platform.js";
 
+// ============ 常量 ============
+
 const API_BASE = "https://api.sgroup.qq.com";
 const TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken";
-
-// ============ User-Agent ============
 const PLUGIN_VERSION = "1.0.0";
 const PLUGIN_USER_AGENT = `QQBotSDK/${PLUGIN_VERSION} (Node/${process.versions.node}; ${os.platform()})`;
-
-// API 请求超时配置
 const DEFAULT_API_TIMEOUT = 30000;
+const FILE_UPLOAD_TIMEOUT = 120000;
+
+// ============ 模块级配置 ============
+
+let moduleLogger: Logger | undefined;
+let markdownSupport = false;
+
+export function setApiLogger(logger: Logger | undefined): void {
+  moduleLogger = logger;
+}
+
+export function initApiConfig(options: { markdownSupport?: boolean }): void {
+  markdownSupport = options.markdownSupport ?? false;
+}
+
+export function isMarkdownSupport(): boolean {
+  return markdownSupport;
+}
+
+// ============ ApiError ============
+
+export class ApiError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly bizCode?: string,
+    public readonly bizMessage?: string,
+    public readonly traceId?: string,
+  ) {
+    super(`API Error ${status}: ${bizMessage ?? bizCode ?? "unknown"}`);
+    this.name = "ApiError";
+  }
+}
 
 // ============ Token 管理 ============
+
 interface TokenCache {
   token: string;
   expiresAt: number;
@@ -27,33 +70,38 @@ interface TokenCache {
 const tokenCacheMap = new Map<string, TokenCache>();
 const tokenFetchPromises = new Map<string, Promise<string>>();
 
+let refreshAbortController: AbortController | null = null;
+
+function getRefreshBuffer(expiresAt: number): number {
+  const remainingMs = expiresAt - Date.now();
+  return Math.min(5 * 60 * 1000, Math.floor(remainingMs / 3));
+}
+
 /**
- * 获取 AccessToken（带缓存 + singleflight 并发安全）
+ * 获取 AccessToken（带缓存 + singleflight）
  */
 export async function getAccessToken(
   appId: string,
   clientSecret: string,
-  log?: Logger
+  log?: Logger,
 ): Promise<string> {
+  const effectiveLog = log ?? moduleLogger;
   const normalizedAppId = String(appId).trim();
   const cached = tokenCacheMap.get(normalizedAppId);
 
-  // 检查缓存：未过期时复用（提前 5 分钟刷新）
-  if (cached && Date.now() < cached.expiresAt - 5 * 60 * 1000) {
+  if (cached && Date.now() < cached.expiresAt - getRefreshBuffer(cached.expiresAt)) {
     return cached.token;
   }
 
-  // Singleflight: 如果当前 appId 已有进行中的 Token 获取请求，复用它
   let fetchPromise = tokenFetchPromises.get(normalizedAppId);
   if (fetchPromise) {
-    log?.debug?.(`[qqbot-api:${normalizedAppId}] Token fetch in progress, waiting...`);
+    effectiveLog?.debug?.(`[qqbot-api:${normalizedAppId}] Token fetch in progress, waiting...`);
     return fetchPromise;
   }
 
-  // 创建新的 Token 获取 Promise
   fetchPromise = (async () => {
     try {
-      return await doFetchToken(normalizedAppId, clientSecret, log);
+      return await doFetchToken(normalizedAppId, clientSecret, effectiveLog);
     } finally {
       tokenFetchPromises.delete(normalizedAppId);
     }
@@ -63,13 +111,10 @@ export async function getAccessToken(
   return fetchPromise;
 }
 
-/**
- * 实际执行 Token 获取
- */
 async function doFetchToken(
   appId: string,
   clientSecret: string,
-  log?: Logger
+  log?: Logger,
 ): Promise<string> {
   log?.info(`[qqbot-api:${appId}] Fetching access token...`);
 
@@ -77,14 +122,10 @@ async function doFetchToken(
   try {
     response = await fetch(TOKEN_URL, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": PLUGIN_USER_AGENT,
-      },
+      headers: { "Content-Type": "application/json", "User-Agent": PLUGIN_USER_AGENT },
       body: JSON.stringify({ appId, clientSecret }),
     });
   } catch (err) {
-    log?.error(`[qqbot-api:${appId}] Network error: ${err}`);
     throw new Error(`Network error getting access_token: ${err instanceof Error ? err.message : String(err)}`);
   }
 
@@ -93,8 +134,7 @@ async function doFetchToken(
 
   let data: { access_token?: string; expires_in?: number };
   try {
-    const rawBody = await response.text();
-    data = JSON.parse(rawBody) as { access_token?: string; expires_in?: number };
+    data = JSON.parse(await response.text()) as { access_token?: string; expires_in?: number };
   } catch (err) {
     throw new Error(`Failed to parse token response: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -122,16 +162,95 @@ export function clearTokenCache(appId?: string): void {
 }
 
 /**
- * API 请求封装
+ * 获取 Token 状态
  */
+export function getTokenStatus(appId: string): TokenStatus {
+  const cached = tokenCacheMap.get(String(appId).trim());
+  if (!cached) return "none";
+  if (tokenFetchPromises.has(String(appId).trim())) return "refreshing";
+  if (cached.expiresAt - Date.now() <= 0) return "expired";
+  if (Date.now() >= cached.expiresAt - getRefreshBuffer(cached.expiresAt)) return "expired";
+  return "valid";
+}
+
+/**
+ * 启动后台 Token 刷新
+ */
+export function startBackgroundTokenRefresh(
+  appId: string,
+  clientSecret: string,
+  log?: Logger,
+): void {
+  stopBackgroundTokenRefresh();
+  const controller = new AbortController();
+  refreshAbortController = controller;
+
+  const run = async () => {
+    while (!controller.signal.aborted) {
+      const cached = tokenCacheMap.get(String(appId).trim());
+      if (!cached) {
+        // 首次没有缓存，立即获取一次
+        try {
+          await getAccessToken(appId, clientSecret, log);
+        } catch (err) {
+          log?.error(`[qqbot-api] Background token fetch failed: ${err}`);
+          await new Promise<void>(r => {
+            const timer = setTimeout(r, 5000);
+            controller.signal.addEventListener("abort", () => { clearTimeout(timer); r(); }, { once: true });
+          });
+        }
+        continue;
+      }
+      const remainingMs = cached.expiresAt - Date.now();
+      const waitMs = Math.max(1000, remainingMs - getRefreshBuffer(cached.expiresAt));
+
+      await new Promise<void>(r => {
+        const timer = setTimeout(r, waitMs);
+        controller.signal.addEventListener("abort", () => { clearTimeout(timer); r(); }, { once: true });
+      });
+
+      if (controller.signal.aborted) break;
+
+      try {
+        await getAccessToken(appId, clientSecret, log);
+      } catch (err) {
+        log?.error(`[qqbot-api] Background token refresh failed: ${err}`);
+      }
+    }
+  };
+
+  run();
+}
+
+/**
+ * 停止后台 Token 刷新
+ */
+export function stopBackgroundTokenRefresh(): void {
+  refreshAbortController?.abort();
+  refreshAbortController = null;
+}
+
+// ============ 底层请求 ============
+
+interface MessageResponse {
+  id: string;
+  timestamp: number | string;
+}
+
+function maskToken(token: string): string {
+  if (token.length <= 8) return "***";
+  return token.slice(0, 4) + "***" + token.slice(-4);
+}
+
 async function apiRequest<T = unknown>(
   accessToken: string,
   method: string,
   path: string,
   body?: unknown,
   timeoutMs = DEFAULT_API_TIMEOUT,
-  log?: Logger
+  log?: Logger,
 ): Promise<T> {
+  const effectiveLog = log ?? moduleLogger;
   const url = `${API_BASE}${path}`;
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -143,7 +262,7 @@ async function apiRequest<T = unknown>(
       "User-Agent": PLUGIN_USER_AGENT,
     };
 
-    log?.debug?.(`[qqbot-api] >>> ${method} ${url}`);
+    effectiveLog?.debug?.(`[qqbot-api] >>> ${method} ${url} (token: ${maskToken(accessToken)})`);
 
     const res = await fetch(url, {
       method,
@@ -153,20 +272,20 @@ async function apiRequest<T = unknown>(
     });
 
     const traceId = res.headers.get("x-tps-trace-id") ?? "";
-    log?.debug?.(`[qqbot-api] <<< ${res.status} ${traceId ? `| TraceId: ${traceId}` : ""}`);
+    effectiveLog?.debug?.(`[qqbot-api] <<< ${res.status} ${traceId ? `| TraceId: ${traceId}` : ""}`);
 
     const rawBody = await res.text();
 
     if (!res.ok) {
-      // HTML 响应 = 网关错误
       if (rawBody.trimStart().startsWith("<")) {
-        throw new Error(`Gateway error ${res.status}, please retry later`);
+        throw new ApiError(res.status, undefined, "Gateway error", traceId);
       }
       try {
-        const error = JSON.parse(rawBody) as { message?: string };
-        throw new Error(`API Error: ${error.message ?? rawBody}`);
-      } catch {
-        throw new Error(`API Error ${res.status}: ${rawBody.slice(0, 200)}`);
+        const err = JSON.parse(rawBody) as { code?: string; message?: string };
+        throw new ApiError(res.status, err.code, err.message, traceId);
+      } catch (e) {
+        if (e instanceof ApiError) throw e;
+        throw new ApiError(res.status, undefined, rawBody.slice(0, 200), traceId);
       }
     }
 
@@ -177,19 +296,60 @@ async function apiRequest<T = unknown>(
 }
 
 /**
- * 获取 Gateway URL
+ * 带重试的 API 请求
  */
+async function apiRequestWithRetry<T = unknown>(
+  accessToken: string,
+  method: string,
+  path: string,
+  body?: unknown,
+  timeoutMs = DEFAULT_API_TIMEOUT,
+  log?: Logger,
+  maxRetries = 2,
+): Promise<T> {
+  let lastError: Error | undefined;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await apiRequest<T>(accessToken, method, path, body, timeoutMs, log);
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      if (attempt < maxRetries && isRetryableError(err)) {
+        const delay = Math.min(1000 * Math.pow(2, attempt), 10000);
+        log?.debug?.(`[qqbot-api] Retry ${attempt + 1}/${maxRetries} after ${delay}ms`);
+        await new Promise(r => setTimeout(r, delay));
+      }
+    }
+  }
+  throw lastError;
+}
+
+function isRetryableError(err: unknown): boolean {
+  if (err instanceof ApiError) return err.status >= 500 || err.status === 429;
+  return true;
+}
+
+function getNextMsgSeq(_msgId: string): number {
+  const timePart = Date.now() % 100000000;
+  const random = Math.floor(Math.random() * 65536);
+  return (timePart ^ random) % 65536;
+}
+
+function buildResult(res: MessageResponse): SendMessageResult {
+  return { success: true, messageId: res.id, timestamp: String(res.timestamp) };
+}
+
+function buildErrorResult(err: unknown): SendMessageResult {
+  return { success: false, error: err instanceof Error ? err.message : String(err) };
+}
+
+// ============ Gateway URL ============
+
 export async function getGatewayUrl(accessToken: string, log?: Logger): Promise<string> {
   const data = await apiRequest<{ url: string }>(accessToken, "GET", "/gateway", undefined, DEFAULT_API_TIMEOUT, log);
   return data.url;
 }
 
-// ============ 消息发送接口 ============
-
-interface MessageResponse {
-  id: string;
-  timestamp: number | string;
-}
+// ============ 消息发送 ============
 
 /**
  * 发送 C2C 私聊消息
@@ -199,30 +359,30 @@ export async function sendC2CMessage(
   openid: string,
   content: string,
   msgId?: string,
-  log?: Logger
+  log?: Logger,
+  options?: SendMessageOptions,
 ): Promise<SendMessageResult> {
   try {
+    const msgType = markdownSupport ? MSG_TYPE_MARKDOWN : MSG_TYPE_TEXT;
     const body: Record<string, unknown> = {
       content,
-      msg_type: 0,
+      msg_type: msgType,
       msg_seq: getNextMsgSeq(msgId ?? ""),
     };
     if (msgId) body.msg_id = msgId;
+    if (options?.message_reference) body.message_reference = options.message_reference;
+
+    if (markdownSupport) {
+      body.markdown = { content };
+      delete body.content;
+    }
 
     const res = await apiRequest<MessageResponse>(
-      accessToken, "POST", `/v2/users/${openid}/messages`, body, DEFAULT_API_TIMEOUT, log
+      accessToken, "POST", `/v2/users/${openid}/messages`, body, DEFAULT_API_TIMEOUT, log,
     );
-
-    return {
-      success: true,
-      messageId: res.id,
-      timestamp: String(res.timestamp),
-    };
+    return buildResult(res);
   } catch (err) {
-    return {
-      success: false,
-      error: err instanceof Error ? err.message : String(err),
-    };
+    return buildErrorResult(err);
   }
 }
 
@@ -234,126 +394,289 @@ export async function sendGroupMessage(
   groupOpenid: string,
   content: string,
   msgId?: string,
-  log?: Logger
+  log?: Logger,
+  options?: SendMessageOptions,
 ): Promise<SendMessageResult> {
   try {
+    const msgType = markdownSupport ? MSG_TYPE_MARKDOWN : MSG_TYPE_TEXT;
     const body: Record<string, unknown> = {
       content,
-      msg_type: 0,
+      msg_type: msgType,
       msg_seq: getNextMsgSeq(msgId ?? ""),
     };
     if (msgId) body.msg_id = msgId;
+    if (options?.message_reference) body.message_reference = options.message_reference;
+
+    if (markdownSupport) {
+      body.markdown = { content };
+      delete body.content;
+    }
 
     const res = await apiRequest<MessageResponse>(
-      accessToken, "POST", `/v2/groups/${groupOpenid}/messages`, body, DEFAULT_API_TIMEOUT, log
+      accessToken, "POST", `/v2/groups/${groupOpenid}/messages`, body, DEFAULT_API_TIMEOUT, log,
     );
-
-    return {
-      success: true,
-      messageId: res.id,
-      timestamp: String(res.timestamp),
-    };
+    return buildResult(res);
   } catch (err) {
-    return {
-      success: false,
-      error: err instanceof Error ? err.message : String(err),
-    };
+    return buildErrorResult(err);
   }
 }
 
 /**
- * 发送主动消息（C2C，无需 msg_id）
+ * 发送主动 C2C 消息
  */
 export async function sendProactiveC2CMessage(
   accessToken: string,
   openid: string,
   content: string,
-  log?: Logger
+  log?: Logger,
 ): Promise<SendMessageResult> {
   try {
-    const body = {
-      content,
-      msg_type: 0,
-    };
-
+    const body = { content, msg_type: MSG_TYPE_TEXT };
     const res = await apiRequest<MessageResponse>(
-      accessToken, "POST", `/v2/users/${openid}/messages`, body, DEFAULT_API_TIMEOUT, log
+      accessToken, "POST", `/v2/users/${openid}/messages`, body, DEFAULT_API_TIMEOUT, log,
     );
-
-    return {
-      success: true,
-      messageId: res.id,
-      timestamp: String(res.timestamp),
-    };
+    return buildResult(res);
   } catch (err) {
-    return {
-      success: false,
-      error: err instanceof Error ? err.message : String(err),
-    };
+    return buildErrorResult(err);
   }
 }
 
 /**
- * 发送主动消息（群聊，无需 msg_id）
+ * 发送主动群聊消息
  */
 export async function sendProactiveGroupMessage(
   accessToken: string,
   groupOpenid: string,
   content: string,
-  log?: Logger
+  log?: Logger,
 ): Promise<SendMessageResult> {
   try {
-    const body = {
-      content,
-      msg_type: 0,
-    };
-
+    const body = { content, msg_type: MSG_TYPE_TEXT };
     const res = await apiRequest<MessageResponse>(
-      accessToken, "POST", `/v2/groups/${groupOpenid}/messages`, body, DEFAULT_API_TIMEOUT, log
+      accessToken, "POST", `/v2/groups/${groupOpenid}/messages`, body, DEFAULT_API_TIMEOUT, log,
     );
-
-    return {
-      success: true,
-      messageId: res.id,
-      timestamp: String(res.timestamp),
-    };
+    return buildResult(res);
   } catch (err) {
-    return {
-      success: false,
-      error: err instanceof Error ? err.message : String(err),
-    };
+    return buildErrorResult(err);
   }
 }
 
-// ============ 工具函数 ============
+/**
+ * 发送带 Inline Keyboard 的 C2C 消息
+ */
+export async function sendC2CMessageWithInlineKeyboard(
+  accessToken: string,
+  openid: string,
+  content: string,
+  keyboard: InlineKeyboard,
+  msgId?: string,
+  log?: Logger,
+): Promise<SendMessageResult> {
+  try {
+    const body: Record<string, unknown> = {
+      content,
+      msg_type: MSG_TYPE_TEXT,
+      keyboard,
+      msg_seq: getNextMsgSeq(msgId ?? ""),
+    };
+    if (msgId) body.msg_id = msgId;
+
+    const res = await apiRequest<MessageResponse>(
+      accessToken, "POST", `/v2/users/${openid}/messages`, body, DEFAULT_API_TIMEOUT, log,
+    );
+    return buildResult(res);
+  } catch (err) {
+    return buildErrorResult(err);
+  }
+}
 
 /**
- * 获取全局唯一的消息序号（范围 0 ~ 65535）
+ * 发送带 Inline Keyboard 的群聊消息
  */
-function getNextMsgSeq(_msgId: string): number {
-  const timePart = Date.now() % 100000000;
-  const random = Math.floor(Math.random() * 65536);
-  return (timePart ^ random) % 65536;
+export async function sendGroupMessageWithInlineKeyboard(
+  accessToken: string,
+  groupOpenid: string,
+  content: string,
+  keyboard: InlineKeyboard,
+  msgId?: string,
+  log?: Logger,
+): Promise<SendMessageResult> {
+  try {
+    const body: Record<string, unknown> = {
+      content,
+      msg_type: MSG_TYPE_TEXT,
+      keyboard,
+      msg_seq: getNextMsgSeq(msgId ?? ""),
+    };
+    if (msgId) body.msg_id = msgId;
+
+    const res = await apiRequest<MessageResponse>(
+      accessToken, "POST", `/v2/groups/${groupOpenid}/messages`, body, DEFAULT_API_TIMEOUT, log,
+    );
+    return buildResult(res);
+  } catch (err) {
+    return buildErrorResult(err);
+  }
 }
 
-// ============ 富媒体消息支持 ============
+/**
+ * 发送 Markdown 消息（C2C）
+ */
+export async function sendC2CMarkdownMessage(
+  accessToken: string,
+  openid: string,
+  content: string,
+  msgId?: string,
+  log?: Logger,
+): Promise<SendMessageResult> {
+  try {
+    const body: Record<string, unknown> = {
+      msg_type: MSG_TYPE_MARKDOWN,
+      markdown: { content },
+      msg_seq: getNextMsgSeq(msgId ?? ""),
+    };
+    if (msgId) body.msg_id = msgId;
 
-const FILE_UPLOAD_TIMEOUT = 120000; // 文件上传 120 秒
-
-interface MessageResponse {
-  id: string;
-  timestamp: number | string;
+    const res = await apiRequest<MessageResponse>(
+      accessToken, "POST", `/v2/users/${openid}/messages`, body, DEFAULT_API_TIMEOUT, log,
+    );
+    return buildResult(res);
+  } catch (err) {
+    return buildErrorResult(err);
+  }
 }
+
+// ============ 流式消息 ============
+
+/**
+ * 发送 C2C 流式消息（打字机效果）
+ */
+export async function sendC2CStreamMessage(
+  accessToken: string,
+  openid: string,
+  request: StreamMessageRequest,
+  log?: Logger,
+): Promise<SendMessageResult> {
+  try {
+    const body: Record<string, unknown> = {
+      input_mode: request.input_mode,
+      input_state: request.input_state,
+      content_type: request.content_type,
+      content_raw: request.content_raw,
+      event_id: request.event_id,
+      msg_id: request.msg_id,
+      msg_seq: request.msg_seq,
+      index: request.index,
+    };
+    if (request.stream_msg_id) {
+      body.stream_msg_id = request.stream_msg_id;
+    }
+
+    const res = await apiRequest<MessageResponse & { stream_msg_id?: string }>(
+      accessToken, "POST", `/v2/users/${openid}/stream_messages`, body, DEFAULT_API_TIMEOUT, log,
+    );
+    const result = buildResult(res);
+    // 上游从响应的 id 字段获取 stream_msg_id
+    result.streamMsgId = res.stream_msg_id ?? res.id;
+    return result;
+  } catch (err) {
+    return buildErrorResult(err);
+  }
+}
+
+// ============ 交互确认 ============
+
+/**
+ * 确认交互事件（按钮点击后必须调用）
+ */
+export async function acknowledgeInteraction(
+  accessToken: string,
+  interactionId: string,
+  code = 0,
+  log?: Logger,
+): Promise<void> {
+  await apiRequest(accessToken, "PUT", `/interactions/${interactionId}`, { code }, DEFAULT_API_TIMEOUT, log);
+}
+
+// ============ 输入状态 ============
+
+/**
+ * 发送 C2C 输入状态通知（"正在输入"）
+ */
+export async function sendC2CInputNotify(
+  accessToken: string,
+  openid: string,
+  msgId?: string,
+  inputSecond = 60,
+  log?: Logger,
+): Promise<void> {
+  const body: Record<string, unknown> = {
+    msg_type: MSG_TYPE_INPUT_NOTIFY,
+    input_notify: {
+      input_type: 1,
+      input_second: inputSecond,
+    },
+    msg_seq: msgId ? getNextMsgSeq(msgId) : 1,
+  };
+  if (msgId) body.msg_id = msgId;
+
+  await apiRequest(
+    accessToken, "POST", `/v2/users/${openid}/messages`, body, DEFAULT_API_TIMEOUT, log,
+  );
+}
+
+// ============ 频道消息 ============
+
+/**
+ * 发送频道消息
+ */
+export async function sendChannelMessage(
+  accessToken: string,
+  channelId: string,
+  content: string,
+  msgId?: string,
+  log?: Logger,
+): Promise<SendMessageResult> {
+  try {
+    const body: Record<string, unknown> = { content, msg_type: MSG_TYPE_TEXT };
+    if (msgId) body.msg_id = msgId;
+
+    const res = await apiRequest<MessageResponse>(
+      accessToken, "POST", `/channels/${channelId}/messages`, body, DEFAULT_API_TIMEOUT, log,
+    );
+    return buildResult(res);
+  } catch (err) {
+    return buildErrorResult(err);
+  }
+}
+
+/**
+ * 发送频道私信
+ */
+export async function sendDmMessage(
+  accessToken: string,
+  guildId: string,
+  content: string,
+  msgId?: string,
+  log?: Logger,
+): Promise<SendMessageResult> {
+  try {
+    const body: Record<string, unknown> = { content, msg_type: MSG_TYPE_TEXT };
+    if (msgId) body.msg_id = msgId;
+
+    const res = await apiRequest<MessageResponse>(
+      accessToken, "POST", `/dms/${guildId}/messages`, body, DEFAULT_API_TIMEOUT, log,
+    );
+    return buildResult(res);
+  } catch (err) {
+    return buildErrorResult(err);
+  }
+}
+
+// ============ 富媒体上传 ============
 
 /**
  * 上传 C2C 私聊媒体文件
- * @param accessToken - 访问令牌
- * @param openid - 用户 OpenID
- * @param fileType - 文件类型 (1=图片, 2=视频, 3=语音, 4=文件)
- * @param url - 文件 URL（可选，与 fileData 二选一）
- * @param fileData - 文件 Base64 数据（可选，与 url 二选一）
- * @param srvSendMsg - 是否由服务端发送消息（默认 false）
- * @param fileName - 文件名（发送文件时必填）
  */
 export async function uploadC2CMedia(
   accessToken: string,
@@ -367,13 +690,10 @@ export async function uploadC2CMedia(
 ): Promise<UploadMediaResponse> {
   if (!url && !fileData) throw new Error("uploadC2CMedia: url or fileData is required");
 
-  // 检查缓存
   if (fileData) {
     const contentHash = computeFileHash(fileData);
     const cachedInfo = getCachedFileInfo(contentHash, "c2c", openid, fileType);
-    if (cachedInfo) {
-      return { file_uuid: "", file_info: cachedInfo, ttl: 0 };
-    }
+    if (cachedInfo) return { file_uuid: "", file_info: cachedInfo, ttl: 0 };
   }
 
   const body: Record<string, unknown> = { file_type: fileType, srv_send_msg: srvSendMsg };
@@ -381,11 +701,10 @@ export async function uploadC2CMedia(
   else if (fileData) body.file_data = fileData;
   if (fileType === 4 && fileName) body.file_name = sanitizeFileName(fileName);
 
-  const result = await apiRequest<UploadMediaResponse>(
-    accessToken, "POST", `/v2/users/${openid}/files`, body, FILE_UPLOAD_TIMEOUT, log
+  const result = await apiRequestWithRetry<UploadMediaResponse>(
+    accessToken, "POST", `/v2/users/${openid}/files`, body, FILE_UPLOAD_TIMEOUT, log,
   );
 
-  // 缓存结果
   if (fileData && result.file_info && result.ttl > 0) {
     const contentHash = computeFileHash(fileData);
     setCachedFileInfo(contentHash, "c2c", openid, fileType, result.file_info, result.file_uuid, result.ttl);
@@ -396,13 +715,6 @@ export async function uploadC2CMedia(
 
 /**
  * 上传群聊媒体文件
- * @param accessToken - 访问令牌
- * @param groupOpenid - 群 OpenID
- * @param fileType - 文件类型 (1=图片, 2=视频, 3=语音, 4=文件)
- * @param url - 文件 URL（可选，与 fileData 二选一）
- * @param fileData - 文件 Base64 数据（可选，与 url 二选一）
- * @param srvSendMsg - 是否由服务端发送消息（默认 false）
- * @param fileName - 文件名（发送文件时必填）
  */
 export async function uploadGroupMedia(
   accessToken: string,
@@ -416,13 +728,10 @@ export async function uploadGroupMedia(
 ): Promise<UploadMediaResponse> {
   if (!url && !fileData) throw new Error("uploadGroupMedia: url or fileData is required");
 
-  // 检查缓存
   if (fileData) {
     const contentHash = computeFileHash(fileData);
     const cachedInfo = getCachedFileInfo(contentHash, "group", groupOpenid, fileType);
-    if (cachedInfo) {
-      return { file_uuid: "", file_info: cachedInfo, ttl: 0 };
-    }
+    if (cachedInfo) return { file_uuid: "", file_info: cachedInfo, ttl: 0 };
   }
 
   const body: Record<string, unknown> = { file_type: fileType, srv_send_msg: srvSendMsg };
@@ -430,11 +739,10 @@ export async function uploadGroupMedia(
   else if (fileData) body.file_data = fileData;
   if (fileType === 4 && fileName) body.file_name = sanitizeFileName(fileName);
 
-  const result = await apiRequest<UploadMediaResponse>(
-    accessToken, "POST", `/v2/groups/${groupOpenid}/files`, body, FILE_UPLOAD_TIMEOUT, log
+  const result = await apiRequestWithRetry<UploadMediaResponse>(
+    accessToken, "POST", `/v2/groups/${groupOpenid}/files`, body, FILE_UPLOAD_TIMEOUT, log,
   );
 
-  // 缓存结果
   if (fileData && result.file_info && result.ttl > 0) {
     const contentHash = computeFileHash(fileData);
     setCachedFileInfo(contentHash, "group", groupOpenid, fileType, result.file_info, result.file_uuid, result.ttl);
@@ -442,6 +750,8 @@ export async function uploadGroupMedia(
 
   return result;
 }
+
+// ============ 媒体消息发送 ============
 
 /**
  * 发送 C2C 媒体消息
@@ -455,29 +765,20 @@ export async function sendC2CMediaMessage(
   log?: Logger,
 ): Promise<SendMessageResult> {
   try {
-    const msgSeq = msgId ? getNextMsgSeq(msgId) : 1;
     const body: Record<string, unknown> = {
-      msg_type: 7,
+      msg_type: MSG_TYPE_MEDIA,
       media: { file_info: fileInfo },
-      msg_seq: msgSeq,
+      msg_seq: msgId ? getNextMsgSeq(msgId) : 1,
     };
     if (content) body.content = content;
     if (msgId) body.msg_id = msgId;
 
     const res = await apiRequest<MessageResponse>(
-      accessToken, "POST", `/v2/users/${openid}/messages`, body, DEFAULT_API_TIMEOUT, log
+      accessToken, "POST", `/v2/users/${openid}/messages`, body, DEFAULT_API_TIMEOUT, log,
     );
-
-    return {
-      success: true,
-      messageId: res.id,
-      timestamp: String(res.timestamp),
-    };
+    return buildResult(res);
   } catch (err) {
-    return {
-      success: false,
-      error: err instanceof Error ? err.message : String(err),
-    };
+    return buildErrorResult(err);
   }
 }
 
@@ -493,36 +794,27 @@ export async function sendGroupMediaMessage(
   log?: Logger,
 ): Promise<SendMessageResult> {
   try {
-    const msgSeq = msgId ? getNextMsgSeq(msgId) : 1;
     const body: Record<string, unknown> = {
-      msg_type: 7,
+      msg_type: MSG_TYPE_MEDIA,
       media: { file_info: fileInfo },
-      msg_seq: msgSeq,
+      msg_seq: msgId ? getNextMsgSeq(msgId) : 1,
     };
     if (content) body.content = content;
     if (msgId) body.msg_id = msgId;
 
     const res = await apiRequest<MessageResponse>(
-      accessToken, "POST", `/v2/groups/${groupOpenid}/messages`, body, DEFAULT_API_TIMEOUT, log
+      accessToken, "POST", `/v2/groups/${groupOpenid}/messages`, body, DEFAULT_API_TIMEOUT, log,
     );
-
-    return {
-      success: true,
-      messageId: res.id,
-      timestamp: String(res.timestamp),
-    };
+    return buildResult(res);
   } catch (err) {
-    return {
-      success: false,
-      error: err instanceof Error ? err.message : String(err),
-    };
+    return buildErrorResult(err);
   }
 }
 
+// ============ 便捷媒体发送函数 ============
+
 /**
- * 发送 C2C 图片消息
- * @param imageUrl - 图片 URL 或 Data URL (data:image/png;base64,...)
- * @param content -  accompanying text content (optional)
+ * 发送 C2C 图片
  */
 export async function sendC2CImageMessage(
   accessToken: string,
@@ -533,30 +825,18 @@ export async function sendC2CImageMessage(
   log?: Logger,
 ): Promise<SendMessageResult> {
   try {
-    let uploadResult: UploadMediaResponse;
-    const base64Data = extractBase64FromDataUrl(imageUrl);
-
-    if (base64Data) {
-      // Base64 Data URL
-      uploadResult = await uploadC2CMedia(accessToken, openid, 1, undefined, base64Data, false, undefined, log);
-    } else {
-      // 普通 URL
-      uploadResult = await uploadC2CMedia(accessToken, openid, 1, imageUrl, undefined, false, undefined, log);
-    }
-
-    return sendC2CMediaMessage(accessToken, openid, uploadResult.file_info, msgId, content, log);
+    const base64 = extractBase64FromDataUrl(imageUrl);
+    const upload = base64
+      ? await uploadC2CMedia(accessToken, openid, 1, undefined, base64, false, undefined, log)
+      : await uploadC2CMedia(accessToken, openid, 1, imageUrl, undefined, false, undefined, log);
+    return sendC2CMediaMessage(accessToken, openid, upload.file_info, msgId, content, log);
   } catch (err) {
-    return {
-      success: false,
-      error: err instanceof Error ? err.message : String(err),
-    };
+    return buildErrorResult(err);
   }
 }
 
 /**
- * 发送群聊图片消息
- * @param imageUrl - 图片 URL 或 Data URL (data:image/png;base64,...)
- * @param content - accompanying text content (optional)
+ * 发送群聊图片
  */
 export async function sendGroupImageMessage(
   accessToken: string,
@@ -567,28 +847,18 @@ export async function sendGroupImageMessage(
   log?: Logger,
 ): Promise<SendMessageResult> {
   try {
-    let uploadResult: UploadMediaResponse;
-    const base64Data = extractBase64FromDataUrl(imageUrl);
-
-    if (base64Data) {
-      uploadResult = await uploadGroupMedia(accessToken, groupOpenid, 1, undefined, base64Data, false, undefined, log);
-    } else {
-      uploadResult = await uploadGroupMedia(accessToken, groupOpenid, 1, imageUrl, undefined, false, undefined, log);
-    }
-
-    return sendGroupMediaMessage(accessToken, groupOpenid, uploadResult.file_info, msgId, content, log);
+    const base64 = extractBase64FromDataUrl(imageUrl);
+    const upload = base64
+      ? await uploadGroupMedia(accessToken, groupOpenid, 1, undefined, base64, false, undefined, log)
+      : await uploadGroupMedia(accessToken, groupOpenid, 1, imageUrl, undefined, false, undefined, log);
+    return sendGroupMediaMessage(accessToken, groupOpenid, upload.file_info, msgId, content, log);
   } catch (err) {
-    return {
-      success: false,
-      error: err instanceof Error ? err.message : String(err),
-    };
+    return buildErrorResult(err);
   }
 }
 
 /**
- * 发送 C2C 语音消息
- * @param voiceBase64 - 语音 Base64 数据（可选，与 voiceUrl 二选一）
- * @param voiceUrl - 语音 URL（可选，与 voiceBase64 二选一）
+ * 发送 C2C 语音
  */
 export async function sendC2CVoiceMessage(
   accessToken: string,
@@ -599,24 +869,16 @@ export async function sendC2CVoiceMessage(
   log?: Logger,
 ): Promise<SendMessageResult> {
   try {
-    if (!voiceBase64 && !voiceUrl) {
-      throw new Error("voiceBase64 or voiceUrl is required");
-    }
-
-    const uploadResult = await uploadC2CMedia(accessToken, openid, 3, voiceUrl, voiceBase64, false, undefined, log);
-    return sendC2CMediaMessage(accessToken, openid, uploadResult.file_info, msgId, undefined, log);
+    if (!voiceBase64 && !voiceUrl) throw new Error("voiceBase64 or voiceUrl is required");
+    const upload = await uploadC2CMedia(accessToken, openid, 3, voiceUrl, voiceBase64, false, undefined, log);
+    return sendC2CMediaMessage(accessToken, openid, upload.file_info, msgId, undefined, log);
   } catch (err) {
-    return {
-      success: false,
-      error: err instanceof Error ? err.message : String(err),
-    };
+    return buildErrorResult(err);
   }
 }
 
 /**
- * 发送群聊语音消息
- * @param voiceBase64 - 语音 Base64 数据（可选，与 voiceUrl 二选一）
- * @param voiceUrl - 语音 URL（可选，与 voiceBase64 二选一）
+ * 发送群聊语音
  */
 export async function sendGroupVoiceMessage(
   accessToken: string,
@@ -627,25 +889,16 @@ export async function sendGroupVoiceMessage(
   log?: Logger,
 ): Promise<SendMessageResult> {
   try {
-    if (!voiceBase64 && !voiceUrl) {
-      throw new Error("voiceBase64 or voiceUrl is required");
-    }
-
-    const uploadResult = await uploadGroupMedia(accessToken, groupOpenid, 3, voiceUrl, voiceBase64, false, undefined, log);
-    return sendGroupMediaMessage(accessToken, groupOpenid, uploadResult.file_info, msgId, undefined, log);
+    if (!voiceBase64 && !voiceUrl) throw new Error("voiceBase64 or voiceUrl is required");
+    const upload = await uploadGroupMedia(accessToken, groupOpenid, 3, voiceUrl, voiceBase64, false, undefined, log);
+    return sendGroupMediaMessage(accessToken, groupOpenid, upload.file_info, msgId, undefined, log);
   } catch (err) {
-    return {
-      success: false,
-      error: err instanceof Error ? err.message : String(err),
-    };
+    return buildErrorResult(err);
   }
 }
 
 /**
- * 发送 C2C 视频消息
- * @param videoUrl - 视频 URL（可选，与 videoBase64 二选一）
- * @param videoBase64 - 视频 Base64 数据（可选，与 videoUrl 二选一）
- * @param content - accompanying text content (optional)
+ * 发送 C2C 视频
  */
 export async function sendC2CVideoMessage(
   accessToken: string,
@@ -657,25 +910,16 @@ export async function sendC2CVideoMessage(
   log?: Logger,
 ): Promise<SendMessageResult> {
   try {
-    if (!videoUrl && !videoBase64) {
-      throw new Error("videoUrl or videoBase64 is required");
-    }
-
-    const uploadResult = await uploadC2CMedia(accessToken, openid, 2, videoUrl, videoBase64, false, undefined, log);
-    return sendC2CMediaMessage(accessToken, openid, uploadResult.file_info, msgId, content, log);
+    if (!videoUrl && !videoBase64) throw new Error("videoUrl or videoBase64 is required");
+    const upload = await uploadC2CMedia(accessToken, openid, 2, videoUrl, videoBase64, false, undefined, log);
+    return sendC2CMediaMessage(accessToken, openid, upload.file_info, msgId, content, log);
   } catch (err) {
-    return {
-      success: false,
-      error: err instanceof Error ? err.message : String(err),
-    };
+    return buildErrorResult(err);
   }
 }
 
 /**
- * 发送群聊视频消息
- * @param videoUrl - 视频 URL（可选，与 videoBase64 二选一）
- * @param videoBase64 - 视频 Base64 数据（可选，与 videoUrl 二选一）
- * @param content - accompanying text content (optional)
+ * 发送群聊视频
  */
 export async function sendGroupVideoMessage(
   accessToken: string,
@@ -687,25 +931,16 @@ export async function sendGroupVideoMessage(
   log?: Logger,
 ): Promise<SendMessageResult> {
   try {
-    if (!videoUrl && !videoBase64) {
-      throw new Error("videoUrl or videoBase64 is required");
-    }
-
-    const uploadResult = await uploadGroupMedia(accessToken, groupOpenid, 2, videoUrl, videoBase64, false, undefined, log);
-    return sendGroupMediaMessage(accessToken, groupOpenid, uploadResult.file_info, msgId, content, log);
+    if (!videoUrl && !videoBase64) throw new Error("videoUrl or videoBase64 is required");
+    const upload = await uploadGroupMedia(accessToken, groupOpenid, 2, videoUrl, videoBase64, false, undefined, log);
+    return sendGroupMediaMessage(accessToken, groupOpenid, upload.file_info, msgId, content, log);
   } catch (err) {
-    return {
-      success: false,
-      error: err instanceof Error ? err.message : String(err),
-    };
+    return buildErrorResult(err);
   }
 }
 
 /**
- * 发送 C2C 文件消息
- * @param fileBase64 - 文件 Base64 数据（可选，与 fileUrl 二选一）
- * @param fileUrl - 文件 URL（可选，与 fileBase64 二选一）
- * @param fileName - 文件名（发送文件时建议提供）
+ * 发送 C2C 文件
  */
 export async function sendC2CFileMessage(
   accessToken: string,
@@ -717,25 +952,16 @@ export async function sendC2CFileMessage(
   log?: Logger,
 ): Promise<SendMessageResult> {
   try {
-    if (!fileBase64 && !fileUrl) {
-      throw new Error("fileBase64 or fileUrl is required");
-    }
-
-    const uploadResult = await uploadC2CMedia(accessToken, openid, 4, fileUrl, fileBase64, false, fileName, log);
-    return sendC2CMediaMessage(accessToken, openid, uploadResult.file_info, msgId, undefined, log);
+    if (!fileBase64 && !fileUrl) throw new Error("fileBase64 or fileUrl is required");
+    const upload = await uploadC2CMedia(accessToken, openid, 4, fileUrl, fileBase64, false, fileName, log);
+    return sendC2CMediaMessage(accessToken, openid, upload.file_info, msgId, undefined, log);
   } catch (err) {
-    return {
-      success: false,
-      error: err instanceof Error ? err.message : String(err),
-    };
+    return buildErrorResult(err);
   }
 }
 
 /**
- * 发送群聊文件消息
- * @param fileBase64 - 文件 Base64 数据（可选，与 fileUrl 二选一）
- * @param fileUrl - 文件 URL（可选，与 fileBase64 二选一）
- * @param fileName - 文件名（发送文件时建议提供）
+ * 发送群聊文件
  */
 export async function sendGroupFileMessage(
   accessToken: string,
@@ -747,16 +973,159 @@ export async function sendGroupFileMessage(
   log?: Logger,
 ): Promise<SendMessageResult> {
   try {
-    if (!fileBase64 && !fileUrl) {
-      throw new Error("fileBase64 or fileUrl is required");
-    }
-
-    const uploadResult = await uploadGroupMedia(accessToken, groupOpenid, 4, fileUrl, fileBase64, false, fileName, log);
-    return sendGroupMediaMessage(accessToken, groupOpenid, uploadResult.file_info, msgId, undefined, log);
+    if (!fileBase64 && !fileUrl) throw new Error("fileBase64 or fileUrl is required");
+    const upload = await uploadGroupMedia(accessToken, groupOpenid, 4, fileUrl, fileBase64, false, fileName, log);
+    return sendGroupMediaMessage(accessToken, groupOpenid, upload.file_info, msgId, undefined, log);
   } catch (err) {
-    return {
-      success: false,
-      error: err instanceof Error ? err.message : String(err),
-    };
+    return buildErrorResult(err);
   }
+}
+
+// ============ 分块上传 API ============
+
+/**
+ * C2C 分块上传 - 准备
+ */
+export async function c2cUploadPrepare(
+  accessToken: string,
+  openid: string,
+  fileType: MediaFileType,
+  fileSize: number,
+  fileName: string,
+  fileHash: string,
+  log?: Logger,
+): Promise<UploadPrepareResponse> {
+  return apiRequest<UploadPrepareResponse>(
+    accessToken, "POST", `/v2/users/${openid}/files/upload-prepare`,
+    { file_type: fileType, file_size: fileSize, file_name: fileName, file_hash: fileHash },
+    DEFAULT_API_TIMEOUT, log,
+  );
+}
+
+/**
+ * C2C 分块上传 - 上传分片
+ */
+export async function c2cUploadPart(
+  accessToken: string,
+  openid: string,
+  fileUuid: string,
+  partNumber: number,
+  partData: Buffer,
+  log?: Logger,
+): Promise<string> {
+  // 使用内部接口上传分片数据
+  const res = await apiRequest<{ etag?: string }>(
+    accessToken, "POST", `/v2/users/${openid}/files/upload-part`,
+    { file_uuid: fileUuid, part_number: partNumber, part_data: partData.toString("base64") },
+    FILE_UPLOAD_TIMEOUT, log,
+  );
+  return res.etag ?? "";
+}
+
+/**
+ * C2C 分块上传 - 分片完成确认
+ */
+export async function c2cUploadPartFinish(
+  accessToken: string,
+  openid: string,
+  fileUuid: string,
+  partNumber: number,
+  etag: string,
+  log?: Logger,
+): Promise<void> {
+  await apiRequest(
+    accessToken, "POST", `/v2/users/${openid}/files/upload-part-finish`,
+    { file_uuid: fileUuid, part_number: partNumber, etag },
+    DEFAULT_API_TIMEOUT, log,
+  );
+}
+
+/**
+ * C2C 分块上传 - 完成上传
+ */
+export async function c2cCompleteUpload(
+  accessToken: string,
+  openid: string,
+  fileUuid: string,
+  parts: UploadPart[],
+  log?: Logger,
+): Promise<UploadMediaResponse> {
+  return apiRequest<UploadMediaResponse>(
+    accessToken, "POST", `/v2/users/${openid}/files/upload-complete`,
+    { file_uuid: fileUuid, parts },
+    DEFAULT_API_TIMEOUT, log,
+  );
+}
+
+/**
+ * 群聊分块上传 - 准备
+ */
+export async function groupUploadPrepare(
+  accessToken: string,
+  groupOpenid: string,
+  fileType: MediaFileType,
+  fileSize: number,
+  fileName: string,
+  fileHash: string,
+  log?: Logger,
+): Promise<UploadPrepareResponse> {
+  return apiRequest<UploadPrepareResponse>(
+    accessToken, "POST", `/v2/groups/${groupOpenid}/files/upload-prepare`,
+    { file_type: fileType, file_size: fileSize, file_name: fileName, file_hash: fileHash },
+    DEFAULT_API_TIMEOUT, log,
+  );
+}
+
+/**
+ * 群聊分块上传 - 上传分片
+ */
+export async function groupUploadPart(
+  accessToken: string,
+  groupOpenid: string,
+  fileUuid: string,
+  partNumber: number,
+  partData: Buffer,
+  log?: Logger,
+): Promise<string> {
+  const res = await apiRequest<{ etag?: string }>(
+    accessToken, "POST", `/v2/groups/${groupOpenid}/files/upload-part`,
+    { file_uuid: fileUuid, part_number: partNumber, part_data: partData.toString("base64") },
+    FILE_UPLOAD_TIMEOUT, log,
+  );
+  return res.etag ?? "";
+}
+
+/**
+ * 群聊分块上传 - 分片完成确认
+ */
+export async function groupUploadPartFinish(
+  accessToken: string,
+  groupOpenid: string,
+  fileUuid: string,
+  partNumber: number,
+  etag: string,
+  log?: Logger,
+): Promise<void> {
+  await apiRequest(
+    accessToken, "POST", `/v2/groups/${groupOpenid}/files/upload-part-finish`,
+    { file_uuid: fileUuid, part_number: partNumber, etag },
+    DEFAULT_API_TIMEOUT, log,
+  );
+}
+
+/**
+ * 群聊分块上传 - 完成上传
+ */
+export async function groupCompleteUpload(
+  accessToken: string,
+  groupOpenid: string,
+  fileUuid: string,
+  parts: UploadPart[],
+  log?: Logger,
+): Promise<UploadMediaResponse> {
+  return apiRequest<UploadMediaResponse>(
+    accessToken, "POST", `/v2/groups/${groupOpenid}/files/upload-complete`,
+    { file_uuid: fileUuid, parts },
+    DEFAULT_API_TIMEOUT, log,
+  );
 }
